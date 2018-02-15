@@ -42,6 +42,7 @@
 #include "utils/syscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "optimizer/prep.h"
 
 
 /* Config variable managed via guc.c */
@@ -163,7 +164,6 @@ static List * SublinkList(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
-static void FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList);
 static List * CreateSubqueryTargetEntryList(List *columnList);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
 											   List *subqueryTargetEntryList);
@@ -3676,7 +3676,6 @@ ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNode,
 static MultiNode *
 SubqueryPushdownMultiNodeTree(Query *queryTree)
 {
-	List *targetEntryList = queryTree->targetList;
 	List *columnList = NIL;
 	List *targetColumnList = NIL;
 	MultiCollect *subqueryCollectNode = CitusMakeNode(MultiCollect);
@@ -3688,6 +3687,9 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	List *subqueryTargetEntryList = NIL;
 	List *havingClauseColumnList = NIL;
 	DeferredErrorMessage *unsupportedQueryError = NULL;
+	bool hasJoinRTEWithoutJoinhAlias = false;
+	ListCell *rteCell = NULL;
+
 
 	/* verify we can perform distributed planning on this query */
 	unsupportedQueryError = DeferErrorIfQueryNotSupported(queryTree);
@@ -3736,17 +3738,58 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	 * Master and worker queries will be created out of this MultiTree at later stages.
 	 */
 
+
+	/*
+	 * TODO: Move this all to a new function
+	 */
+	foreach(rteCell, queryTree->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
+		if (rte->rtekind == RTE_JOIN && rte->alias == NULL)
+		{
+			/*
+			 * TODO: This may not work well with multiple joins
+			 * some have alias some not. So, doing it indivitually
+			 * might make more sense.
+			 */
+			hasJoinRTEWithoutJoinhAlias = true;
+			break;
+		}
+	}
+
+	/*
+	 * If a join doesn't have an alias, the target list could refer to the
+	 * elements of the join. Howoever, if a join does have an alias, the individual
+	 * elements of the join cannot be referred from the target list. Thus, we shouldn't
+	 * flatten for those cases.
+	 */
+	if (hasJoinRTEWithoutJoinhAlias)
+	{
+		PlannerInfo *root = makeNode(PlannerInfo);
+
+		root->parse = (queryTree);
+		root->planner_cxt = CurrentMemoryContext;
+		root->hasJoinRTEs = true;
+
+		queryTree->targetList = (List *) flatten_join_alias_vars(root,
+																 (Node *) queryTree->
+																 targetList);
+
+		queryTree->havingQual = (Node *) flatten_join_alias_vars(root,
+																 (Node *) queryTree->
+																 havingQual);
+	}
+
+
 	/*
 	 * uniqueColumnList contains all columns returned by subquery. Subquery target
 	 * entry list, subquery range table entry's column name list are derived from
 	 * uniqueColumnList. Columns mentioned in multiProject node and multiExtendedOp
 	 * node are indexed with their respective position in uniqueColumnList.
 	 */
-	targetColumnList = pull_var_clause_default((Node *) targetEntryList);
+	targetColumnList = pull_var_clause_default((Node *) queryTree->targetList);
 	havingClauseColumnList = pull_var_clause_default(queryTree->havingQual);
 	columnList = list_concat(targetColumnList, havingClauseColumnList);
-
-	FixupDuplicateColumnRangeTableEntryReference(columnList, queryTree->rtable);
 
 	/* create a target entry for each unique column */
 	subqueryTargetEntryList = CreateSubqueryTargetEntryList(columnList);
@@ -3772,7 +3815,7 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	currentTopNode = (MultiNode *) subqueryCollectNode;
 
 	/* build project node for the columns to project */
-	projectNode = MultiProjectNode(targetEntryList);
+	projectNode = MultiProjectNode(queryTree->targetList);
 	SetChild((MultiUnaryNode *) projectNode, currentTopNode);
 	currentTopNode = (MultiNode *) projectNode;
 
@@ -3812,91 +3855,6 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	currentTopNode = (MultiNode *) extendedOpNode;
 
 	return currentTopNode;
-}
-
-
-/*
- * FixupDuplicateColumnRangeTableEntryReference iterates over provided
- * columnList to identify multiple references of the same column that is used
- * from a different range table entry.
- *
- * This is required because Postgres allows columns to be referenced using
- * a join alias. Therefore the same column from a table could be referenced
- * twice using its absolute table name (t1.a), and without table name (a).
- * This is a problem when one of them is inside the group by clause and the
- * other is not. Postgres is smart about it to detect that both target columns
- * resolve to the same thing, and allows a single group by clause to cover
- * both target entries. Here we want to find out the repetitions of the same
- * column, if there are any, we use the column's first appearance's reference.
- * We did this beacuse blindly converting join alias name to column reference
- * breaks some nested queries with CTEs.
- */
-static void
-FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList)
-{
-	ListCell *columnCell = NULL;
-	List *previousColumnList = NIL;
-
-	foreach(columnCell, columnList)
-	{
-		Var *column = (Var *) lfirst(columnCell);
-		RangeTblEntry *columnRte = NULL;
-		RangeTblEntry *previousColumnRte = NULL;
-		ListCell *previousColumnCell = NULL;
-		Var *foundColumn = NULL;
-
-		Assert(IsA(column, Var));
-
-		/*
-		 * Determine if we have seen this column previously. We use
-		 * the original column var (normalizedColumn) from relation RTE
-		 * to determine if two columns are equivalent. column and
-		 * normalizeColumn are essentially the same. They only differ
-		 * when a column belongs to a JOIN_RTE in which we use normalized
-		 * column for comparisons.
-		 */
-		foreach(previousColumnCell, previousColumnList)
-		{
-			Var *previousColumn = (Var *) lfirst(previousColumnCell);
-			Var *normalizedColumn = NULL;
-			Var *normalizedPreviousColumn = NULL;
-
-			columnRte = rt_fetch(column->varno, rteList);
-			normalizedColumn = column;
-			if (columnRte->rtekind == RTE_JOIN)
-			{
-				normalizedColumn = (Var *) list_nth(columnRte->joinaliasvars,
-													column->varattno - 1);
-			}
-
-			normalizedPreviousColumn = previousColumn;
-			previousColumnRte = rt_fetch(previousColumn->varno, rteList);
-			if (previousColumnRte->rtekind == RTE_JOIN)
-			{
-				normalizedPreviousColumn = (Var *) list_nth(
-					previousColumnRte->joinaliasvars, previousColumn->varattno - 1);
-			}
-
-			if (normalizedPreviousColumn->varno == normalizedColumn->varno &&
-				normalizedPreviousColumn->varattno == normalizedColumn->varattno)
-			{
-				foundColumn = previousColumn;
-				break;
-			}
-		}
-
-		if (foundColumn != NULL)
-		{
-			/* replace column varno/varattno values with referenced columns var */
-			column->varno = foundColumn->varno;
-			column->varattno = foundColumn->varattno;
-		}
-		else
-		{
-			/* add only new columns to previous column list */
-			previousColumnList = lappend(previousColumnList, column);
-		}
-	}
 }
 
 
