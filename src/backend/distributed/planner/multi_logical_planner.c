@@ -3763,7 +3763,7 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	 * elements of the join cannot be referred from the target list. Thus, we shouldn't
 	 * flatten for those cases.
 	 */
-	if (hasJoinRTEWithoutJoinhAlias)
+	if (true || hasJoinRTEWithoutJoinhAlias)
 	{
 		PlannerInfo *root = makeNode(PlannerInfo);
 
@@ -3780,6 +3780,21 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 																 havingQual);
 	}
 
+	{
+		List *joinList = NIL;
+		ListCell *joinCell = NULL;
+
+		joinList = JoinExprList(queryTree->jointree);
+		foreach(joinCell, joinList)
+		{
+			JoinExpr *joinExpr = lfirst(joinCell);
+			if (joinExpr->alias != NULL)
+			{
+				joinExpr->alias = NULL;
+			}
+
+		}
+	}
 
 	/*
 	 * uniqueColumnList contains all columns returned by subquery. Subquery target
