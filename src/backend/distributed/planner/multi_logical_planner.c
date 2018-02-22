@@ -2071,7 +2071,8 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorHint = filterHint;
 	}
 
-	if (queryTree->hasWindowFuncs &&
+
+	if (false && queryTree->hasWindowFuncs &&
 		!SafeToPushdownWindowFunction(queryTree, &errorInfo))
 	{
 		preconditionsSatisfied = false;
@@ -3101,6 +3102,8 @@ MultiProjectNode(List *targetEntryList)
 static MultiExtendedOp *
 MultiExtendedOpNode(Query *queryTree)
 {
+	StringInfo errorDetail = NULL;
+
 	MultiExtendedOp *extendedOpNode = CitusMakeNode(MultiExtendedOp);
 	extendedOpNode->targetList = queryTree->targetList;
 	extendedOpNode->groupClauseList = queryTree->groupClause;
@@ -3112,6 +3115,11 @@ MultiExtendedOpNode(Query *queryTree)
 	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;
 	extendedOpNode->hasWindowFuncs = queryTree->hasWindowFuncs;
 	extendedOpNode->windowClause = queryTree->windowClause;
+
+	if (queryTree->hasWindowFuncs)
+	{
+		extendedOpNode->hasNonPushableWindowFunction = !SafeToPushdownWindowFunction(queryTree, &errorDetail);
+	}
 
 	return extendedOpNode;
 }

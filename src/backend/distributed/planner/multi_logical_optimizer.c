@@ -71,6 +71,7 @@ typedef struct WorkerAggregateWalkerContext
 	List *expressionList;
 	bool createGroupByClause;
 	bool pullDistinctColumns;
+	bool pullAllColumns;
 } WorkerAggregateWalkerContext;
 
 
@@ -127,6 +128,7 @@ static Expr * MasterAggregateExpression(Aggref *originalAggregate,
 static Expr * MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 									  AttrNumber *columnId);
 static Expr * AddTypeConversion(Node *originalAggregate, Node *newExpression);
+static Node * MasterPullWindowFunction(Node * originalExpression, MasterAggregateWalkerContext *walkerContext);
 static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 											  bool groupedByDisjointPartitionColumn,
 											  List *tableNodeList);
@@ -270,6 +272,8 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
 	groupedByDisjointPartitionColumn = GroupedByDisjointPartitionColumn(tableNodeList,
 																		extendedOpNode);
+
+	elog(WARNING, "Original Op Node : %s", nodeToString(extendedOpNode));
 
 	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode,
 												groupedByDisjointPartitionColumn,
@@ -1264,6 +1268,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 		sizeof(MasterAggregateWalkerContext));
 	bool hasNonPartitionColumnDistinctAgg = false;
 	bool repartitionSubquery = false;
+	bool pullWindowFunctions = false;
 
 	walkerContext->columnId = 1;
 
@@ -1279,6 +1284,8 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 		ShouldPullDistinctColumn(repartitionSubquery, groupedByDisjointPartitionColumn,
 								 hasNonPartitionColumnDistinctAgg);
 
+	pullWindowFunctions = walkerContext->pullDistinctColumns ||  originalOpNode->hasNonPushableWindowFunction;
+
 	/* iterate over original target entries */
 	foreach(targetEntryCell, targetEntryList)
 	{
@@ -1286,12 +1293,18 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 		TargetEntry *newTargetEntry = copyObject(originalTargetEntry);
 		Expr *originalExpression = originalTargetEntry->expr;
 		Expr *newExpression = NULL;
-
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
+		bool hasWindowFunction = contain_window_function((Node *) originalExpression);
+
 		if (hasAggregates)
 		{
 			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
 												   walkerContext);
+			newExpression = (Expr *) newNode;
+		}
+		else if (originalOpNode->hasNonPushableWindowFunction && hasWindowFunction)
+		{
+			Node *newNode = MasterPullWindowFunction((Node *) originalExpression, walkerContext);
 			newExpression = (Expr *) newNode;
 		}
 		else
@@ -1319,6 +1332,10 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 		newHavingQual = MasterAggregateMutator(originalHavingQual, walkerContext);
 	}
 
+	if (pullWindowFunctions && originalOpNode->windowClause != NIL)
+	{
+		elog(WARNING, "tello");
+	}
 	masterExtendedOpNode = CitusMakeNode(MultiExtendedOp);
 	masterExtendedOpNode->targetList = newTargetEntryList;
 	masterExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
@@ -1329,6 +1346,14 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
 	masterExtendedOpNode->havingQual = newHavingQual;
 
+	if (pullWindowFunctions)
+	{
+		masterExtendedOpNode->hasWindowFuncs = originalOpNode->hasWindowFuncs;
+		masterExtendedOpNode->windowClause = originalOpNode->windowClause;
+		masterExtendedOpNode->hasNonPushableWindowFunction = true;
+	}
+
+	elog(WARNING, "master extended op node : %s", nodeToString(masterExtendedOpNode));
 	return masterExtendedOpNode;
 }
 
@@ -1788,6 +1813,30 @@ AddTypeConversion(Node *originalAggregate, Node *newExpression)
 
 
 /*
+ * MasterPullWindowFunction
+ */
+static Node *
+MasterPullWindowFunction(Node * originalExpression, MasterAggregateWalkerContext *walkerContext)
+{
+	Node *newExpression = copyObject(originalExpression);
+	List *varList = pull_var_clause_default(newExpression);
+	ListCell *varCell = NULL;
+
+	elog(WARNING, "window expression : %s", nodeToString(originalExpression));
+
+	foreach(varCell, varList)
+	{
+		Var *column = (Var *) lfirst(varCell);
+		column->varattno = walkerContext->columnId;
+		column->varoattno = walkerContext->columnId;
+		walkerContext->columnId++;
+	}
+
+	elog(WARNING, "new window expression : %s", nodeToString(newExpression));
+
+	return newExpression;
+}
+/*
  * WorkerExtendedOpNode creates the worker extended operator node from the given
  * target entries. The function walks over these target entries; and for entries
  * with aggregates in them, this function calls the recursive aggregate walker
@@ -1819,6 +1868,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	bool enableLimitPushdown = true;
 	bool hasNonPartitionColumnDistinctAgg = false;
 	bool repartitionSubquery = false;
+	bool pullWindowFunctions = false;
 
 	walkerContext->expressionList = NIL;
 
@@ -1846,6 +1896,9 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	walkerContext->pullDistinctColumns =
 		ShouldPullDistinctColumn(repartitionSubquery, groupedByDisjointPartitionColumn,
 								 hasNonPartitionColumnDistinctAgg);
+	walkerContext->pullAllColumns = originalOpNode->hasNonPushableWindowFunction;
+
+	pullWindowFunctions = walkerContext->pullDistinctColumns ||  originalOpNode->hasNonPushableWindowFunction;
 
 	/* iterate over original target entries */
 	foreach(targetEntryCell, targetEntryList)
@@ -1855,6 +1908,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 		List *newExpressionList = NIL;
 		ListCell *newExpressionCell = NULL;
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
+		bool hasWindowFunction = contain_window_function( (Node *) originalExpression);
 
 		/* reset walker context */
 		walkerContext->expressionList = NIL;
@@ -1866,6 +1920,11 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 
 			newExpressionList = walkerContext->expressionList;
 			queryHasAggregates = true;
+		}
+		else if (hasWindowFunction && pullWindowFunctions)
+		{
+			newExpressionList = pull_var_clause_default((Node *) originalExpression);
+			enableLimitPushdown = false;
 		}
 		else
 		{
@@ -1972,14 +2031,47 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 		}
 	}
 
+	if (pullWindowFunctions && originalOpNode->windowClause != NIL)
+	{
+		List *columnList = pull_var_clause_default((Node *) originalOpNode->windowClause);
+		ListCell *columnCell = NULL;
+
+		foreach(columnCell, columnList)
+		{
+			TargetEntry *newTargetEntry = makeNode(TargetEntry);
+			StringInfo columnNameString = makeStringInfo();
+
+			Expr *newExpression = (Expr *) lfirst(columnCell);
+			newTargetEntry->expr = newExpression;
+
+			appendStringInfo(columnNameString, WORKER_COLUMN_FORMAT,
+							 targetProjectionNumber);
+			newTargetEntry->resname = columnNameString->data;
+
+			/* force resjunk to false as we may need this on the master */
+			newTargetEntry->resjunk = false;
+			newTargetEntry->resno = targetProjectionNumber;
+
+			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
+			targetProjectionNumber++;
+
+			/* limit needs to be processed after the window clause */
+			enableLimitPushdown = false;
+		}
+	}
+
 	workerExtendedOpNode = CitusMakeNode(MultiExtendedOp);
 	workerExtendedOpNode->targetList = newTargetEntryList;
 	workerExtendedOpNode->distinctClause = NIL;
 	workerExtendedOpNode->hasDistinctOn = false;
-	workerExtendedOpNode->hasWindowFuncs = originalOpNode->hasWindowFuncs;
-	workerExtendedOpNode->windowClause = originalOpNode->windowClause;
 
-	if (!queryHasAggregates)
+	if (!pullWindowFunctions && originalOpNode->hasWindowFuncs)
+	{
+		workerExtendedOpNode->hasWindowFuncs = originalOpNode->hasWindowFuncs;
+		workerExtendedOpNode->windowClause = originalOpNode->windowClause;
+	}
+
+	if (!queryHasAggregates && !pullWindowFunctions)
 	{
 		workerExtendedOpNode->distinctClause = originalOpNode->distinctClause;
 		workerExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
@@ -2004,6 +2096,8 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	{
 		workerExtendedOpNode->havingQual = originalOpNode->havingQual;
 	}
+
+	elog(WARNING, " worker extended op : %s", nodeToString(workerExtendedOpNode));
 
 	return workerExtendedOpNode;
 }
