@@ -1422,6 +1422,7 @@ StoreQueryResult(CitusScanState *scanState, MultiConnection *connection,
 			char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
 			int category = 0;
 			bool isConstraintViolation = false;
+			bool fatalError = (resultStatus == PGRES_FATAL_ERROR);
 
 			MarkRemoteTransactionFailed(connection, false);
 
@@ -1445,6 +1446,12 @@ StoreQueryResult(CitusScanState *scanState, MultiConnection *connection,
 			PQclear(result);
 
 			commandFailed = true;
+
+			/* an error happened, there is nothing we can do more */
+			if (fatalError)
+			{
+				break;
+			}
 
 			/* continue, there could be other lingering results due to row mode */
 			continue;
@@ -1541,6 +1548,7 @@ ConsumeQueryResult(MultiConnection *connection, bool failOnError, int64 *rows)
 			char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
 			int category = 0;
 			bool isConstraintViolation = false;
+			bool fatalError = (status == PGRES_FATAL_ERROR);
 
 			MarkRemoteTransactionFailed(connection, false);
 
@@ -1564,6 +1572,12 @@ ConsumeQueryResult(MultiConnection *connection, bool failOnError, int64 *rows)
 			PQclear(result);
 
 			commandFailed = true;
+
+			/* an error happened, there is nothing we can do more */
+			if (fatalError)
+			{
+				break;
+			}
 
 			/* continue, there could be other lingering results due to row mode */
 			continue;
